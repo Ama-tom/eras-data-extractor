@@ -38,7 +38,9 @@ st.markdown("""
 # ── Constants ─────────────────────────────────────────────────────────────────
 WHO_REGIONS       = ["", "AFR", "AMR", "EMR", "EUR", "SEAR", "WPR"]
 INCOME_GROUPS     = ["", "LIC", "LMIC", "UMIC", "HIC"]
-STUDY_DESIGNS     = ["", "RCT", "Prospective Cohort", "Retrospective Cohort",
+STUDY_DESIGNS     = ["", "RCT", "Prospective Cohort",
+                      "Prospective comparative (non-randomized)",
+                      "Retrospective Cohort",
                       "Before-After (Quasi-experimental)", "Cross-sectional",
                       "Case-Control", "Interrupted Time Series", "Other"]
 IMPL_TYPES        = ["", "Partial (<50%)", "Moderate (50–70%)", "Comprehensive (>70%)"]
@@ -47,8 +49,9 @@ STATS_METHODS     = ["", "Random-effects (DerSimonian-Laird)", "Fixed-effects",
                       "HKSJ correction", "Peto OR", "Arcsine transformation", "Other"]
 YN                = ["", "Y", "N"]
 SPECIALTIES       = ["", "Colorectal", "Hepatobiliary", "Upper GI / Oesophagogastric",
-                      "Urology", "Gynaecology / Oncology", "Orthopaedics",
-                      "Vascular", "Thoracic", "General Surgery", "Mixed", "Other"]
+                      "Urology", "Gynaecology / Oncology", "Obstetrics",
+                      "Orthopaedics", "Vascular", "Thoracic",
+                      "General Surgery", "Mixed", "Other"]
 LOS_TYPES         = ["", "Total Hospital", "ICU", "Ward"]
 LOS_MEASURES      = ["", "Mean", "Median"]
 COMP_SCOPES       = ["", "Overall", "Specific"]
@@ -360,17 +363,22 @@ _COUNTRY_DB = {
 def smart_extract_common(text: str) -> dict:
     from collections import Counter
     d = {}
-    # ── Study design ──────────────────────────────────────────────────────────
-    if re.search(r'\b(randomized|randomised)\s+controlled\s+trial\b|\bRCT\b', text, re.I):
+    # ── Study design — only inspect first 2000 chars so cited RCTs in Discussion
+    #    don't override the actual study design of this paper ─────────────────
+    lead = text[:2000]
+    if re.search(r'\b(randomized|randomised)\s+controlled\s+trial\b|\bRCT\b', lead, re.I):
         d['study_design'] = 'RCT'
-    elif re.search(r'\bprospective\s+cohort\b', text, re.I):
+    elif re.search(r'\bprospective\s+cohort\b', lead, re.I):
         d['study_design'] = 'Prospective Cohort'
-    elif re.search(r'\bretrospective\b', text, re.I):
+    elif re.search(r'\bretrospective\b', lead, re.I):
         d['study_design'] = 'Retrospective Cohort'
-    elif re.search(r'\bbefore[\s\-]after\b|\bpre[\s\-]post\b|\bquasi[\s\-]experimental\b', text, re.I):
+    elif re.search(r'\bbefore[\s\-]after\b|\bpre[\s\-]post\b|\bquasi[\s\-]experimental\b', lead, re.I):
         d['study_design'] = 'Before-After (Quasi-experimental)'
-    elif re.search(r'\binterrupted\s+time\s+series\b', text, re.I):
+    elif re.search(r'\binterrupted\s+time\s+series\b', lead, re.I):
         d['study_design'] = 'Interrupted Time Series'
+    elif (re.search(r'\bprospective\b', lead, re.I) and
+          re.search(r'\b(compar|control|conventional|two\s+group|both\s+group)\b', lead, re.I)):
+        d['study_design'] = 'Prospective comparative (non-randomized)'
 
     # ── Country (longest key first to avoid 'uk' matching before 'united kingdom') ──
     tl = text.lower()
@@ -380,30 +388,46 @@ def smart_extract_common(text: str) -> dict:
             break
 
     # ── N values ──────────────────────────────────────────────────────────────
-    # Total: allow words between "participants" and assignment verb
-    m = re.search(
+    # N total — multiple patterns in priority order
+    for _pat in [
+        # "100 patients/women were included/enrolled/recruited"
+        r'(\d{2,4})\s+(?:participants|patients|women|subjects|adults)\s+were\s+(?:enrolled|included|recruited)',
+        # "total of 100 patients"
+        r'total\s+of\s+(\d{2,4})\s+(?:participants|patients|women|subjects)',
+        # "100 were included in our/the study"
+        r'(\d{2,4})\s+were\s+included\s+in\s+(?:our|the)\s+study',
+        # "100 patients/women … assigned/enrolled/randomized" (words between)
         r'(\d{2,4})\s+(?:participants|patients|women|subjects|adults)'
         r'[^.]{0,150}?(?:randomly\s+)?(?:assigned|enrolled|randomized|randomised|recruited)',
-        text, re.I | re.S)
-    if m: d['n_total'] = int(m.group(1))
+    ]:
+        m = re.search(_pat, text, re.I | re.S)
+        if m: d['n_total'] = int(m.group(1)); break
 
-    # ERAS group N
+    # ERAS group N — multiple patterns in priority order
     for pat in [
         r'(\d+)\s+(?:were\s+)?(?:allocated|assigned|randomized|randomised)\s+to\s+(?:the\s+)?ERAS',
-        r'ERAS\s+group\s*\(\s*[nN]\s*=\s*(\d+)',
+        r'ERAS\s+(?:pathway|arm|group)[,\s]+(\d+)\s+(?:women|patients)',
+        # "50 women underwent LSCS [in the ERAS pathway]"
+        r'(?:ERAS[^.]{0,60}?)(\d+)\s+(?:women|patients)\s+underwent',
+        r'(\d+)\s+(?:women|patients)\s+(?:underwent|were\s+in)\s+(?:the\s+)?(?:ERAS|enhanced\s+recovery)',
+        r'ERAS\s+group\s*[\(,]\s*[nN]\s*=\s*(\d+)',
         r'ERAS\s+\(\s*[nN]\s*=\s*(\d+)',
-        r'ERAS\s+group[^\n]*?n\s*=\s*(\d+)',
+        r'ERAS\s+group[^\n]{0,40}?n\s*=\s*(\d+)',
+        r'(\d+)\s+(?:were\s+)?(?:allocated|assigned)\s+to\s+(?:the\s+)?intervention',
     ]:
         m = re.search(pat, text, re.I)
         if m: d['n_eras'] = int(m.group(1)); break
 
-    # Control group N — includes "and 50 to the control group" pattern
+    # Control group N
     for pat in [
         r'(\d+)\s+(?:were\s+)?(?:allocated|assigned|randomized|randomised)\s+to\s+(?:the\s+)?control',
         r'and\s+(\d+)\s+to\s+(?:the\s+)?control',
+        r'while\s+(\d+)\s+received\s+conventional',
+        r'(\d+)\s+received\s+conventional\s+(?:care|perioperative)',
         r'(\d+)\s+to\s+(?:the\s+)?control\s+group',
-        r'control\s+group\s*\(\s*[nN]\s*=\s*(\d+)',
+        r'control\s+group\s*[\(,]\s*[nN]\s*=\s*(\d+)',
         r'control\s+\(\s*[nN]\s*=\s*(\d+)',
+        r'non.ERAS\s+group[^\n]{0,40}?n\s*=\s*(\d+)',
     ]:
         m = re.search(pat, text, re.I)
         if m: d['n_control'] = int(m.group(1)); break
@@ -432,18 +456,29 @@ def smart_extract_common(text: str) -> dict:
             abbr = re.sub(r'[^A-Za-z]', '', d['first_author'])[:2].upper()
             d['study_id'] = f"{abbr}{d['year']}01"
 
-    # ── Surgical specialty ────────────────────────────────────────────────────
-    for pat, spec in [
+    # ── Surgical specialty ─────────────────────────────────────────────────────
+    # Priority list — Obstetrics before Colorectal to avoid false matches
+    # when papers mention other specialties only as background examples.
+    # Search title+abstract area (first 1500 chars) first; fall back to full text.
+    _spec_patterns = [
+        (r'\b(caesarean|cesarean|LSCS|lower\s+segment\s+caesar)\b',    'Obstetrics'),
+        (r'\b(obstetric)\b',                                            'Obstetrics'),
+        (r'\b(gynae|gynecol|hysterectomy|ovarian|endometri)\b',        'Gynaecology / Oncology'),
         (r'\b(colorectal|colon\s+cancer|rectal\s+cancer|colectomy|sigmoid)\b', 'Colorectal'),
         (r'\b(hepatobiliary|hepatic|liver\s+resection|pancreatectomy|cholecystectomy)\b', 'Hepatobiliary'),
         (r'\b(oesophag|esophag|gastrectomy|gastric\s+cancer|upper\s+GI)\b', 'Upper GI / Oesophagogastric'),
-        (r'\b(cystectomy|nephrectomy|prostatectomy|urolog)\b', 'Urology'),
-        (r'\b(gynae|gynecol|obstetric|cesarean|caesarean|hysterectomy|ovarian)\b', 'Gynaecology / Oncology'),
+        (r'\b(cystectomy|nephrectomy|prostatectomy|urolog)\b',         'Urology'),
         (r'\b(arthroplasty|hip\s+replacement|knee\s+replacement|orthop)\b', 'Orthopaedics'),
-        (r'\b(aortic|aorta|vascular|endarterectomy)\b', 'Vascular'),
-        (r'\b(thorac|lung\s+resection|lobectomy|pneumonectomy)\b', 'Thoracic'),
-    ]:
-        if re.search(pat, text, re.I): d['surgical_specialty'] = spec; break
+        (r'\b(aortic|aorta|vascular|endarterectomy)\b',               'Vascular'),
+        (r'\b(thorac|lung\s+resection|lobectomy|pneumonectomy)\b',    'Thoracic'),
+    ]
+    for zone in [text[:1500], text]:   # title+abstract first, then full text
+        for pat, spec in _spec_patterns:
+            if re.search(pat, zone, re.I):
+                d['surgical_specialty'] = spec
+                break
+        if 'surgical_specialty' in d:
+            break
 
     # ── Specific procedure (short snippet) ────────────────────────────────────
     for pat in [
@@ -458,6 +493,17 @@ def smart_extract_common(text: str) -> dict:
 
 def smart_extract_los(text: str) -> dict:
     d = {}
+
+    # ── Detect if LOS is reported in hours → must convert to days ────────────
+    _los_hours = bool(
+        re.search(r'[Ll]ength\s+of\s+(?:hospital\s+)?stay\s*\(hours?\)', text, re.I) or
+        re.search(r'[Ll]ength\s+of\s+(?:hospital\s+)?stay[^.\n]{0,60}\bhours?\b', text, re.I)
+    )
+
+    def _to_days(v):
+        """If LOS was in hours, divide by 24 and round to 3 dp."""
+        return round(v / 24, 3) if _los_hours else v
+
     # ── Table row: "Length of hospital stay  3.2±1.1  5.4±1.3" ───────────────
     # Use [\s\S] so it works whether values are on same line or next cell
     _val = r'(\d+\.\d+)\s*' + _PM + r'(\d+\.\d+)'
@@ -467,8 +513,12 @@ def smart_extract_los(text: str) -> dict:
         text)
     if m:
         d.update(los_type='Total Hospital', los_measure='Mean',
-                 los_eras=float(m.group(1)), los_eras_sd=float(m.group(2)),
-                 los_control=float(m.group(3)), los_ctrl_sd=float(m.group(4)))
+                 los_eras    =_to_days(float(m.group(1))),
+                 los_eras_sd =_to_days(float(m.group(2))),
+                 los_control =_to_days(float(m.group(3))),
+                 los_ctrl_sd =_to_days(float(m.group(4))))
+        if _los_hours:
+            d['notes_auto'] = "LOS originally reported in hours; auto-converted ÷24 to days."
 
     # ── Prose: "shorter hospital stay (3.2 ± 1.1 days)…control group (5.4 ± 1.3 days)" ──
     if 'los_eras' not in d:
@@ -478,8 +528,12 @@ def smart_extract_los(text: str) -> dict:
             text, re.I | re.S)
         if m2:
             d.update(los_type='Total Hospital', los_measure='Mean',
-                     los_eras=float(m2.group(1)), los_eras_sd=float(m2.group(2)),
-                     los_control=float(m2.group(3)), los_ctrl_sd=float(m2.group(4)))
+                     los_eras    =_to_days(float(m2.group(1))),
+                     los_eras_sd =_to_days(float(m2.group(2))),
+                     los_control =_to_days(float(m2.group(3))),
+                     los_ctrl_sd =_to_days(float(m2.group(4))))
+            if _los_hours:
+                d['notes_auto'] = "LOS originally reported in hours; auto-converted ÷24 to days."
 
     # ── Median IQR: "X.X (X.X–X.X)" ──────────────────────────────────────────
     if 'los_eras' not in d:
@@ -537,11 +591,27 @@ def smart_extract_comp(text: str, n_eras: int = 0, n_ctrl: int = 0) -> dict:
         if n_ctrl > 0: d['rate_ctrl'] = round(ev_c / n_ctrl * 100, 2)
         try: d['p_value'] = float(re.sub(r'[<>*]', '', m.group(3)))
         except: pass
-    # Specific complication types
-    if re.search(r'\bSSI\b|surgical\s+site\s+infection', text, re.I):  d['ssi_reported']  = 'Y'
-    if re.search(r'anastomotic\s+leak', text, re.I):                    d['al_reported']   = 'Y'
-    if re.search(r'\bileus\b|\bPOI\b|paralytic\s+ileus', text, re.I):  d['poi_reported']  = 'Y'
-    if re.search(r'pulmonar|pneumonia', text, re.I):                    d['pulm_reported'] = 'Y'
+    # Specific complication types — only flag if mentioned as an outcome,
+    # not merely in exclusion criteria or the Methods exclusion list.
+    def _outcome_mention(keyword_pat: str) -> bool:
+        """True if keyword appears near outcome/result language (not just exclusions)."""
+        hits = list(re.finditer(keyword_pat, text, re.I | re.S))
+        if not hits:
+            return False
+        for hit in hits:
+            # 200-char window around the match
+            ctx_start = max(0, hit.start() - 200)
+            ctx = text[ctx_start: hit.end() + 200].lower()
+            # Skip if surrounded by exclusion/comorbidity language
+            if re.search(r'exclud|exclusion|comorbid|eligib|criteria', ctx):
+                continue
+            return True
+        return False
+
+    if _outcome_mention(r'\bSSI\b|surgical\s+site\s+infection'):   d['ssi_reported']  = 'Y'
+    if _outcome_mention(r'anastomotic\s+leak'):                     d['al_reported']   = 'Y'
+    if _outcome_mention(r'\bileus\b|\bPOI\b|paralytic\s+ileus'):   d['poi_reported']  = 'Y'
+    if re.search(r'pulmonar|pneumonia', text, re.I):                d['pulm_reported'] = 'Y'
     if re.search(r'\bUTI\b|urinary\s+(?:tract\s+)?infection', text, re.I): d['urin_reported'] = 'Y'
     return d
 
@@ -600,6 +670,11 @@ def smart_extract_all(text: str, outcome: str) -> dict:
     elif outcome == "O3_READ":   d.update(smart_extract_read(text))
     elif outcome == "O4_MORT":   d.update(smart_extract_mort(text))
     elif outcome == "ADHERENCE": d.update(smart_extract_adherence(text))
+    # Promote auto-notes into the notes field so they appear in the form
+    if d.get('notes_auto'):
+        existing = d.get('notes', '') or ''
+        d['notes'] = (existing + "\n" + d['notes_auto']).strip()
+        del d['notes_auto']
     return d
 
 
@@ -613,7 +688,7 @@ def common_id_form(key_prefix: str, defaults: dict) -> dict:
                                     help="Format: [2 letters][Year][Seq] e.g. SM202301")
         first_author= c2.text_input("First Author *",   d.get("first_author",""),key=f"{key_prefix}_auth")
         year        = c3.number_input("Year *",          min_value=1990, max_value=2030,
-                                      value=int(d.get("year", 2020)),         key=f"{key_prefix}_year")
+                                      value=int(d.get("year", date.today().year)), key=f"{key_prefix}_year")
         c4, c5, c6 = st.columns(3)
         country     = c4.text_input("Country",           d.get("country",""),    key=f"{key_prefix}_cntry")
         who_region  = c5.selectbox("WHO Region",         WHO_REGIONS,
@@ -795,6 +870,8 @@ def form_o1(study_idx: int):
 
     col_sv, col_cl = st.columns([1, 5])
     if col_sv.button("💾 Save Record", key=f"save_{outcome}_{study_idx}", type="primary"):
+        if not id_data.get("study_id") and not id_data.get("first_author"):
+            st.warning("⚠️ Enter Study ID or First Author before saving."); st.stop()
         rec = {**id_data,
                "los_type": los_type, "los_measure": los_measure,
                "los_eras": los_eras, "los_eras_sd": los_eras_sd,
@@ -855,6 +932,8 @@ def form_o2(study_idx: int):
     meta = meta_fields(f"{outcome}_{study_idx}", d)
 
     if st.button("💾 Save Record", key=f"save_{outcome}_{study_idx}", type="primary"):
+        if not id_data.get("study_id") and not id_data.get("first_author"):
+            st.warning("⚠️ Enter Study ID or First Author before saving."); st.stop()
         rec = {**id_data,
                "complication_scope": comp_scope, "complication_type": comp_type,
                "cd_reported": cd_reported, "cd_grade": cd_grade,
@@ -897,6 +976,8 @@ def form_o3(study_idx: int):
     meta = meta_fields(f"{outcome}_{study_idx}", d)
 
     if st.button("💾 Save Record", key=f"save_{outcome}_{study_idx}", type="primary"):
+        if not id_data.get("study_id") and not id_data.get("first_author"):
+            st.warning("⚠️ Enter Study ID or First Author before saving."); st.stop()
         rec = {**id_data,
                "readmission_timeframe": timeframe, "timeframe_other": tf_other,
                "events_eras": int(ev_eras), "events_control": int(ev_ctrl),
@@ -933,6 +1014,8 @@ def form_o4(study_idx: int):
     meta = meta_fields(f"{outcome}_{study_idx}", d)
 
     if st.button("💾 Save Record", key=f"save_{outcome}_{study_idx}", type="primary"):
+        if not id_data.get("study_id") and not id_data.get("first_author"):
+            st.warning("⚠️ Enter Study ID or First Author before saving."); st.stop()
         rec = {**id_data,
                "mortality_type": mort_type,
                "events_eras": int(ev_eras), "events_control": int(ev_ctrl),
@@ -959,8 +1042,9 @@ def form_o5(study_idx: int):
     components  = c2.selectbox("Cost Components",  COST_COMP,
                                 index=COST_COMP.index(d.get("cost_components","")) if d.get("cost_components","") in COST_COMP else 0,
                                 key=f"{outcome}_{study_idx}_cc")
-    cost_year   = c3.number_input("Year of Costing", min_value=1990, max_value=2026,
-                                   value=int(d.get("year_of_costing") or 2020), key=f"{outcome}_{study_idx}_cy")
+    cost_year   = c3.number_input("Year of Costing", min_value=1990, max_value=2030,
+                                   value=int(d.get("year_of_costing") or d.get("year") or date.today().year),
+                                   key=f"{outcome}_{study_idx}_cy")
     currency    = c4.text_input("Original Currency", d.get("original_currency",""),
                                  key=f"{outcome}_{study_idx}_cur", help="e.g. USD, EUR, ETB, GBP")
     c5,c6,c7 = st.columns(3)
@@ -988,6 +1072,8 @@ def form_o5(study_idx: int):
     meta = meta_fields(f"{outcome}_{study_idx}", d)
 
     if st.button("💾 Save Record", key=f"save_{outcome}_{study_idx}", type="primary"):
+        if not id_data.get("study_id") and not id_data.get("first_author"):
+            st.warning("⚠️ Enter Study ID or First Author before saving."); st.stop()
         rec = {**id_data,
                "cost_perspective": persp, "cost_components": components,
                "year_of_costing": int(cost_year), "original_currency": currency,
@@ -1052,6 +1138,8 @@ def form_adherence(study_idx: int):
     notes = st.text_area("Notes", d.get("notes",""), height=80, key=f"{outcome}_{study_idx}_notes")
 
     if st.button("💾 Save Record", key=f"save_{outcome}_{study_idx}", type="primary"):
+        if not id_data.get("study_id") and not id_data.get("first_author"):
+            st.warning("⚠️ Enter Study ID or First Author before saving."); st.stop()
         rec = {**id_data,
                "total_elements": int(total_elem), "implemented_elements": int(impl_elem),
                "overall_adherence_rate": overall_adh, "adherence_category": adh_cat,
@@ -1077,7 +1165,7 @@ def form_geo(study_idx: int):
         c1,c2,c3,c4 = st.columns(4)
         study_id = c1.text_input("Study ID", d.get("study_id",""), key=f"{outcome}_{study_idx}_sid")
         auth     = c2.text_input("First Author", d.get("first_author",""), key=f"{outcome}_{study_idx}_auth")
-        year     = c3.number_input("Year", 1990, 2030, int(d.get("year",2020)), key=f"{outcome}_{study_idx}_yr")
+        year     = c3.number_input("Year", 1990, 2030, int(d.get("year", date.today().year)), key=f"{outcome}_{study_idx}_year")
         country  = c4.text_input("Country", d.get("country",""), key=f"{outcome}_{study_idx}_cnt")
         c5,c6,c7,c8 = st.columns(4)
         who_reg  = c5.selectbox("WHO Region", WHO_REGIONS,
